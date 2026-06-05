@@ -71,6 +71,22 @@ let prog_sw_dumped = ref false
    this is the self-contained term whose reduction does not terminate. *)
 let prog_whnf_entry : term option ref = ref None
 
+(* count of rewrite-rule firings per head symbol — symbols whose count grows without
+   bound are the ones being rewritten infinitely (the loop). *)
+let prog_rule_fires : (string, int) Hashtbl.t = Hashtbl.create 64
+
+let prog_rule_bump (n : name) : unit =
+  if dk_progress then
+    let k = string_of_mident (md n) ^ "." ^ string_of_ident (id n) in
+    Hashtbl.replace prog_rule_fires k
+      (1 + (try Hashtbl.find prog_rule_fires k with Not_found -> 0))
+
+let prog_rule_top () : string =
+  let l = Hashtbl.fold (fun k v acc -> (k, v) :: acc) prog_rule_fires [] in
+  let l = List.sort (fun (_, a) (_, b) -> compare b a) l in
+  let rec take n = function [] -> [] | x :: xs -> if n <= 0 then [] else x :: take (n - 1) xs in
+  String.concat "  " (List.map (fun (k, v) -> Printf.sprintf "%s=%d" k v) (take 10 l))
+
 let level_modules =
   [ "lvl"; "sublvl"; "nat"; "normalize"; "AuxLvls"; "bool"; "instantiate" ]
 
@@ -122,6 +138,7 @@ let prog_reset (name : string) (total : int) : unit =
     prog_sw_steps := 0;
     prog_sw_last_t := (try Unix.gettimeofday () with _ -> 0.0);
     prog_sw_dumped := false;
+    Hashtbl.clear prog_rule_fires;
     prog_last_t := (try Unix.gettimeofday () with _ -> 0.0);
     Printf.eprintf "[DK_PROGRESS] >>> checking %s (%d nodes)\n%!" name total)
 
@@ -603,7 +620,8 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
           prog_sw_last_t := now;
           let cur = try term_of_state st with _ -> st.term in
           Format.eprintf "[DK_WHNF] %s: state_whnf step %d  redex: %a@."
-            !prog_decl !prog_sw_steps (pp_trunc 12) cur
+            !prog_decl !prog_sw_steps (pp_trunc 12) cur;
+          Printf.eprintf "    rule firings (top): %s\n%!" (prog_rule_top ())
         end
       end
     end;
@@ -651,7 +669,9 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
             in
             match gamma_rw sg !selection s1 tree with
             | None -> comb_state_if_AC alg sg st
-            | Some (_, ctx, term) -> rec_call ctx term s2))
+            | Some (_, ctx, term) ->
+                if dk_progress then prog_rule_bump n;
+                rec_call ctx term s2))
 
   (* ************************************************************** *)
 
