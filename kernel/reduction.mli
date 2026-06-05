@@ -5,6 +5,16 @@ open Term
 
 val d_reduce : Debug.flag
 
+(** DK_PROGRESS heartbeat (see reduction.ml). Enabled via the DK_PROGRESS env var. *)
+val dk_progress : bool
+
+(** Type-checker descent-node counter, driven by the typing module. *)
+val prog_nodes : int ref
+
+(** [prog_reset name total] starts progress tracking for declaration [name]
+    whose term has [total] nodes. *)
+val prog_reset : string -> int -> unit
+
 type red_target = Snf | Whnf
 
 type red_strategy = ByName | ByValue | ByStrongValue

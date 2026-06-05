@@ -16,6 +16,54 @@ open Ac
    set-based comparison, handled separately in [conversion_step]). *)
 let dk_lazy_delta = try Sys.getenv "DK_LAZY_DELTA" <> "" with Not_found -> false
 
+(* DK_PROGRESS: lightweight per-declaration progress heartbeat, to tell whether
+   type-checking is making progress or stuck on a subterm. Enabled by setting the
+   DK_PROGRESS environment variable. [prog_nodes]/[prog_total] track the typing
+   descent over the declaration (a percentage); [prog_conv]/[prog_whnf] count
+   convertibility pairs / whnf calls. Every ~2s a heartbeat reports them: a frozen
+   descent % with a climbing conv counter means we are stuck reducing one subterm. *)
+let dk_progress = try Sys.getenv "DK_PROGRESS" <> "" with Not_found -> false
+
+let prog_conv = ref 0
+
+let prog_whnf = ref 0
+
+let prog_nodes = ref 0
+
+let prog_total = ref 0
+
+let prog_last_t = ref 0.0
+
+let prog_last_conv = ref 0
+
+let prog_decl = ref ""
+
+let prog_reset (name : string) (total : int) : unit =
+  if dk_progress then (
+    prog_conv := 0;
+    prog_whnf := 0;
+    prog_nodes := 0;
+    prog_total := total;
+    prog_last_conv := 0;
+    prog_decl := name;
+    prog_last_t := (try Unix.gettimeofday () with _ -> 0.0);
+    Printf.eprintf "[DK_PROGRESS] >>> checking %s (%d nodes)\n%!" name total)
+
+let prog_beat () =
+  if dk_progress then
+    let now = try Unix.gettimeofday () with _ -> 0.0 in
+    if now -. !prog_last_t >= 2.0 then (
+      let pct =
+        if !prog_total <= 0 then 0.0
+        else 100.0 *. float_of_int !prog_nodes /. float_of_int !prog_total
+      in
+      Printf.eprintf
+        "[DK_PROGRESS] %s: descent %d/%d (%.1f%%)  conv=%d (+%d/2s)  whnf=%d\n%!"
+        !prog_decl !prog_nodes !prog_total pct !prog_conv
+        (!prog_conv - !prog_last_conv) !prog_whnf;
+      prog_last_t := now;
+      prog_last_conv := !prog_conv)
+
 let d_reduce = Debug.register_flag "Reduce"
 
 type red_target = Snf | Whnf
@@ -464,7 +512,11 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
   (* ************************************************************** *)
 
   (* Weak Head Normal Form *)
-  and whnf sg term = term_of_state (state_whnf sg (state_of_term term))
+  and whnf sg term =
+    if dk_progress then (
+      incr prog_whnf;
+      if !prog_whnf land 0x3FFF = 0 then prog_beat ());
+    term_of_state (state_whnf sg (state_of_term term))
 
   (* Strong Normal Form *)
   and snf sg (t : term) : term =
@@ -516,6 +568,9 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
   let rec are_convertible_lst sg : (term * term) list -> bool = function
     | [] -> true
     | (t1, t2) :: lst ->
+        if dk_progress then (
+          incr prog_conv;
+          if !prog_conv land 0x3FFF = 0 then prog_beat ());
         (* Check physical equality first for optimisation. *)
         if t1 == t2 then are_convertible_lst sg lst
           (* This test can be less expensive than computing the `whnf` if the

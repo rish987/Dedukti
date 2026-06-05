@@ -12,6 +12,17 @@ let coc = ref false
 
 let fail_on_unsatisfiable_constraints = ref false
 
+(* Number of term nodes; the DK_PROGRESS heartbeat uses this as a descent denominator. *)
+let rec term_size (t : term) : int =
+  match t with
+  | Kind | Type _ | DB _ | Const _ -> 1
+  | App (f, a, args) ->
+      List.fold_left (fun n x -> n + term_size x)
+        (1 + term_size f + term_size a) args
+  | Lam (_, _, None, b) -> 1 + term_size b
+  | Lam (_, _, Some a, b) -> 1 + term_size a + term_size b
+  | Pi (_, _, a, b) -> 1 + term_size a + term_size b
+
 type typ = term
 
 (* ********************** ERROR MESSAGES *)
@@ -75,6 +86,7 @@ module Make (R : Reduction.S) : S = struct
      which is a list of additional equalities, which are useful when checking subject reduction *)
   let rec infer' sg (c : SR.lhs_typing_cstr) (d : int) (ctx : typed_context)
       (te : term) : typ =
+    if Reduction.dk_progress then incr Reduction.prog_nodes;
     Debug.(debug d_typeChecking "Inferring: %a" pp_term te);
     match te with
     | Kind -> raise (Typing_error KindIsNotTypable)
@@ -104,6 +116,7 @@ module Make (R : Reduction.S) : S = struct
 
   and check' sg (c : SR.lhs_typing_cstr) (d : int) (ctx : typed_context)
       (te : term) (ty_exp : typ) : unit =
+    if Reduction.dk_progress then incr Reduction.prog_nodes;
     Debug.debug d_typeChecking "Checking (%a) [%a]: %a : %a" pp_loc (get_loc te)
       pp_typed_context ctx pp_term te pp_term ty_exp;
     match te with
@@ -147,6 +160,7 @@ module Make (R : Reduction.S) : S = struct
   let inference sg (te : term) : typ = infer sg [] te
 
   let checking sg (te : term) (ty : term) : unit =
+    Reduction.prog_reset "decl" (term_size te + term_size ty);
     let _ = infer sg [] ty in
     check sg [] te ty
 
@@ -396,6 +410,9 @@ module Make (R : Reduction.S) : S = struct
     in
     Debug.(debug d_rule "Typechecking rule %a" pp_rule_name rule.name);
     (* Optimize the unifier then use it to check the type of the RHS *)
+    Reduction.prog_reset
+      (Format.asprintf "rule %a" pp_rule_name rule.name)
+      (term_size rule.rhs);
     check' sg (SR.optimize sg unif) 0 ctx2 rule.rhs ty_le;
     check_type_annotations sg sub ctx2 rule.ctx;
     Debug.(
