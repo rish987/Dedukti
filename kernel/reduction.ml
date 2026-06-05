@@ -38,6 +38,71 @@ let prog_last_conv = ref 0
 
 let prog_decl = ref ""
 
+(* ---- diagnostics: capture the diverging pair when stuck ---- *)
+(* outermost are_convertible pair (the "equation" the type-checker requested) *)
+let prog_seed : (term * term) option ref = ref None
+
+(* worklist pair most recently processed *)
+let prog_cur : (term * term) option ref = ref None
+
+let prog_depth = ref 0
+
+let prog_dumped = ref false
+
+(* composition of conversion work: universe-level machinery vs. genuine terms *)
+let prog_conv_lvl = ref 0
+
+let prog_conv_oth = ref 0
+
+let prog_last_lvl = ref 0
+
+let prog_last_oth = ref 0
+
+(* state_whnf rewrite-loop instrumentation: catches non-termination *inside* a
+   single whnf call (where the conv/whnf-entry counters can't, since we never
+   return to them). Its own timer, since the outer prog_beat is starved. *)
+let prog_sw_steps = ref 0
+
+let prog_sw_last_t = ref 0.0
+
+let prog_sw_dumped = ref false
+
+(* the term most recently passed to [whnf]; if that whnf call loops in state_whnf,
+   this is the self-contained term whose reduction does not terminate. *)
+let prog_whnf_entry : term option ref = ref None
+
+let level_modules =
+  [ "lvl"; "sublvl"; "nat"; "normalize"; "AuxLvls"; "bool"; "instantiate" ]
+
+let rec prog_head (t : term) : term =
+  match t with App (f, _, _) -> prog_head f | _ -> t
+
+let pair_is_level (t1 : term) (t2 : term) : bool =
+  let mod_of t =
+    match prog_head t with
+    | Const (_, n) -> Some (string_of_mident (md n))
+    | _ -> None
+  in
+  let is_lvl = function Some m -> List.mem m level_modules | None -> false in
+  is_lvl (mod_of t1) || is_lvl (mod_of t2)
+
+(* depth-bounded term printer so we can dump giant/looping subterms cheaply *)
+let rec pp_trunc (d : int) (fmt : Format.formatter) (t : term) : unit =
+  if d <= 0 then Format.fprintf fmt "_"
+  else
+    match t with
+    | Kind -> Format.fprintf fmt "Kind"
+    | Type _ -> Format.fprintf fmt "Type"
+    | DB (_, x, n) -> Format.fprintf fmt "%a#%d" pp_ident x n
+    | Const (_, c) -> Format.fprintf fmt "%a" pp_name c
+    | App (f, a, args) ->
+        Format.fprintf fmt "(%a %a%s)" (pp_trunc (d - 1)) f (pp_trunc (d - 1)) a
+          (if args = [] then "" else Format.asprintf " +%d" (List.length args))
+    | Lam (_, x, _, b) -> Format.fprintf fmt "\\%a.%a" pp_ident x (pp_trunc (d - 1)) b
+    | Pi (_, x, a, b) ->
+        Format.fprintf fmt "{%a:%a}%a" pp_ident x (pp_trunc (d - 1)) a
+          (pp_trunc (d - 1)) b
+
 let prog_reset (name : string) (total : int) : unit =
   if dk_progress then (
     prog_conv := 0;
@@ -46,6 +111,17 @@ let prog_reset (name : string) (total : int) : unit =
     prog_total := total;
     prog_last_conv := 0;
     prog_decl := name;
+    prog_seed := None;
+    prog_cur := None;
+    prog_depth := 0;
+    prog_dumped := false;
+    prog_conv_lvl := 0;
+    prog_conv_oth := 0;
+    prog_last_lvl := 0;
+    prog_last_oth := 0;
+    prog_sw_steps := 0;
+    prog_sw_last_t := (try Unix.gettimeofday () with _ -> 0.0);
+    prog_sw_dumped := false;
     prog_last_t := (try Unix.gettimeofday () with _ -> 0.0);
     Printf.eprintf "[DK_PROGRESS] >>> checking %s (%d nodes)\n%!" name total)
 
@@ -61,8 +137,34 @@ let prog_beat () =
         "[DK_PROGRESS] %s: descent %d/%d (%.1f%%)  conv=%d (+%d/2s)  whnf=%d\n%!"
         !prog_decl !prog_nodes !prog_total pct !prog_conv
         (!prog_conv - !prog_last_conv) !prog_whnf;
+      Printf.eprintf "    conv composition: level=%d (+%d/2s)  other=%d (+%d/2s)\n%!"
+        !prog_conv_lvl (!prog_conv_lvl - !prog_last_lvl)
+        !prog_conv_oth (!prog_conv_oth - !prog_last_oth);
+      (match !prog_seed with
+      | Some (l, r) ->
+          Format.eprintf "    seed L: %a@.    seed R: %a@." (pp_trunc 10) l (pp_trunc 10) r
+      | None -> ());
+      (match !prog_cur with
+      | Some (l, r) ->
+          Format.eprintf "    cur  L: %a@.    cur  R: %a@." (pp_trunc 9) l (pp_trunc 9) r
+      | None -> ());
+      (if (not !prog_dumped) && !prog_conv > 150_000 then
+         match !prog_seed with
+         | Some (l, r) ->
+             prog_dumped := true;
+             (try
+                let oc = open_out "/tmp/dk_seed_full.txt" in
+                let fmt = Format.formatter_of_out_channel oc in
+                Format.fprintf fmt "SEED L:@.%a@.@.SEED R:@.%a@." pp_term l pp_term r;
+                Format.pp_print_flush fmt ();
+                close_out oc;
+                Printf.eprintf "    [dumped full seed pair to /tmp/dk_seed_full.txt]\n%!"
+              with _ -> ())
+         | None -> ());
       prog_last_t := now;
-      prog_last_conv := !prog_conv)
+      prog_last_conv := !prog_conv;
+      prog_last_lvl := !prog_conv_lvl;
+      prog_last_oth := !prog_conv_oth)
 
 let d_reduce = Debug.register_flag "Reduce"
 
@@ -463,6 +565,48 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
     (*
   Debug.(debug D_reduce "Reducing %a" pp_state_oneline st);
   *)
+    if dk_progress then begin
+      incr prog_sw_steps;
+      (* One-shot: dump the first `maxhelper`-headed redex once we're clearly in the
+         loop. Checked frequently (every 0x3F steps) so we don't miss it. This is the
+         self-contained level-normalization redex `maxhelper (cons …) v`. *)
+      if (not !prog_sw_dumped) && !prog_sw_steps > 100_000 && !prog_sw_steps land 0x3F = 0
+      then begin
+        let is_mh =
+          match prog_head st.term with
+          | Const (_, n) -> string_of_ident (id n) = "maxhelper"
+          | _ -> false
+        in
+        if is_mh then begin
+          prog_sw_dumped := true;
+          let cur = try term_of_state st with _ -> st.term in
+          (try
+             let oc = open_out "/tmp/dk_whnf_loop.txt" in
+             let fmt = Format.formatter_of_out_channel oc in
+             Format.fprintf fmt
+               "looping maxhelper redex (state_whnf step %d):@.%a@.@."
+               !prog_sw_steps pp_term cur;
+             (match !prog_seed with
+              | Some (l, r) ->
+                  Format.fprintf fmt "OUTERMOST are_convertible seed (the looping check):@.SEED L:@.%a@.@.SEED R:@.%a@."
+                    pp_term l pp_term r
+              | None -> Format.fprintf fmt "(no seed captured)@.");
+             Format.pp_print_flush fmt ();
+             close_out oc;
+             Printf.eprintf "    [dumped looping maxhelper redex + seed to /tmp/dk_whnf_loop.txt]\n%!"
+           with _ -> ())
+        end
+      end;
+      if !prog_sw_steps land 0x3FFF = 0 then begin
+        let now = try Unix.gettimeofday () with _ -> 0.0 in
+        if now -. !prog_sw_last_t >= 2.0 then begin
+          prog_sw_last_t := now;
+          let cur = try term_of_state st with _ -> st.term in
+          Format.eprintf "[DK_WHNF] %s: state_whnf step %d  redex: %a@."
+            !prog_decl !prog_sw_steps (pp_trunc 12) cur
+        end
+      end
+    end;
     let rec_call ctx term stack = state_whnf sg {ctx; term; stack} in
     match st with
     (* Weak head beta normal terms *)
@@ -515,6 +659,7 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
   and whnf sg term =
     if dk_progress then (
       incr prog_whnf;
+      prog_whnf_entry := Some term;
       if !prog_whnf land 0x3FFF = 0 then prog_beat ());
     term_of_state (state_whnf sg (state_of_term term))
 
@@ -570,6 +715,8 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
     | (t1, t2) :: lst ->
         if dk_progress then (
           incr prog_conv;
+          if pair_is_level t1 t2 then incr prog_conv_lvl else incr prog_conv_oth;
+          prog_cur := Some (t1, t2);
           if !prog_conv land 0x3FFF = 0 then prog_beat ());
         (* Check physical equality first for optimisation. *)
         if t1 == t2 then are_convertible_lst sg lst
@@ -595,8 +742,15 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
 
   (* Convertibility Test *)
   and are_convertible sg t1 t2 =
-    try are_convertible_lst sg [(t1, t2)]
-    with Not_convertible | Invalid_argument _ -> false
+    if dk_progress then (
+      if !prog_depth = 0 then prog_seed := Some (t1, t2);
+      incr prog_depth);
+    let r =
+      try are_convertible_lst sg [(t1, t2)]
+      with Not_convertible | Invalid_argument _ -> false
+    in
+    if dk_progress then decr prog_depth;
+    r
 
   (* ************************************************************** *)
 
