@@ -4,6 +4,18 @@ open Term
 open Dtree
 open Ac
 
+(* DK_LAZY_DELTA: when comparing two applications headed by the SAME (non-AC)
+   constant with equal arity, try arg-wise convertibility (congruence) BEFORE
+   whnf-unfolding the head. This mirrors Lean's lazy-delta `isDefEqArgs`: it
+   avoids unfolding (e.g.) well-founded recursors when the arguments are already
+   convertible, which keeps the conversion check out of reduction sequences that
+   have no normal form (the `Acc`/`WellFounded.fix` accessibility-proof towers).
+   Sound: congruence is always valid, and we fall back to the usual whnf-based
+   step when the arguments are not (syntactically/recursively) convertible, so
+   completeness is preserved. AC-headed symbols are excluded (they need
+   set-based comparison, handled separately in [conversion_step]). *)
+let dk_lazy_delta = try Sys.getenv "DK_LAZY_DELTA" <> "" with Not_found -> false
+
 let d_reduce = Debug.register_flag "Reduce"
 
 type red_target = Snf | Whnf
@@ -505,15 +517,29 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
     | [] -> true
     | (t1, t2) :: lst ->
         (* Check physical equality first for optimisation. *)
-        are_convertible_lst sg
-          (if t1 == t2 then lst
-           (* This test can be less expensive than computing the `whnf` if the
-              two terms are equal. *)
-          else if term_eq t1 t2 then lst
-          else conversion_step sg (whnf sg t1, whnf sg t2) lst)
+        if t1 == t2 then are_convertible_lst sg lst
+          (* This test can be less expensive than computing the `whnf` if the
+             two terms are equal. *)
+        else if term_eq t1 t2 then are_convertible_lst sg lst
+        else if dk_lazy_delta && lazy_delta_congruent sg t1 t2 then
+          (* Closed by arg-wise congruence without unfolding the shared head. *)
+          are_convertible_lst sg lst
+        else are_convertible_lst sg (conversion_step sg (whnf sg t1, whnf sg t2) lst)
+
+  (* Lazy-delta congruence (see [dk_lazy_delta]): [t1] and [t2] are applications
+     of the same non-AC constant to the same number of arguments, all pairwise
+     convertible. *)
+  and lazy_delta_congruent sg (t1 : term) (t2 : term) : bool =
+    match (t1, t2) with
+    | App (Const (lc, f), a1, r1), App (Const (_, f2), a2, r2)
+      when name_eq f f2
+           && (not (Signature.is_AC sg lc f))
+           && List.length r1 = List.length r2 ->
+        are_convertible sg a1 a2 && List.for_all2 (are_convertible sg) r1 r2
+    | _ -> false
 
   (* Convertibility Test *)
-  let are_convertible sg t1 t2 =
+  and are_convertible sg t1 t2 =
     try are_convertible_lst sg [(t1, t2)]
     with Not_convertible | Invalid_argument _ -> false
 
