@@ -115,6 +115,10 @@ val add_declaration : t -> loc -> ident -> scope -> staticity -> term -> unit
     All rules must be on the same symbol. *)
 val add_rules : t -> Rule.rule_infos list -> unit
 
+(** Fired whenever the signature is mutated (declaration or rules added). The
+    reduction module installs a callback here to invalidate its memoization caches. *)
+val on_signature_change : (unit -> unit) ref
+
 type rw_infos = {
   stat : staticity;  (** Whether a symbol is definable *)
   ty : term;  (** The type of a symbol *)

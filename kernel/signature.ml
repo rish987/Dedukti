@@ -240,7 +240,13 @@ let check_confluence_on_import lc (md : mident) (ctx : rw_infos HId.t) : unit =
   with Confluence_error e ->
     raise (Signature_error (ConfluenceErrorImport (lc, md, e)))
 
+(* Hook fired whenever the signature is mutated (a declaration or rules added).
+   [Reduction] installs its cache-clearing function here so that its convertibility
+   / whnf memoization caches (which assume a fixed signature) are invalidated. *)
+let on_signature_change : (unit -> unit) ref = ref (fun () -> ())
+
 let add_external_declaration sg lc cst scope stat ty =
+  !on_signature_change ();
   try
     let env = HMd.find sg.tables (md cst) in
     if HId.mem env (id cst) then
@@ -394,6 +400,7 @@ let add_declaration sg lc v st ty =
 let add_rules sg = function
   | [] -> ()
   | r :: _ as rs -> (
+      !on_signature_change ();
       try
         add_rule_infos sg rs;
         if not (mident_eq sg.md (md r.cst)) then

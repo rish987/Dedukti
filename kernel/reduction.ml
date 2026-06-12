@@ -71,6 +71,48 @@ let prog_sw_dumped = ref false
    this is the self-contained term whose reduction does not terminate. *)
 let prog_whnf_entry : term option ref = ref None
 
+(* value of [prog_sw_steps] when the current whnf call started; lets us measure the
+   state_whnf steps spent *within a single whnf call* (the cumulative counter cannot).
+   If this exceeds a large bound, that one whnf call is genuinely non-terminating. *)
+let prog_whnf_entry_steps : int ref = ref 0
+
+(* the typing context (Gamma) of the convertibility check currently in progress,
+   stashed by typing.ml. Used to lambda-close a looping subterm into a standalone,
+   well-typed term for `#EVAL`/`#CHECK`. Innermost binder (DB 0) is the list head. *)
+let prog_typing_ctx : (Basic.loc * Basic.ident * term) list ref = ref []
+
+(* Per-declaration materialization budget (DK_TOS_BUDGET): a cap on the number of term
+   nodes [term_of_state] may build while checking one declaration. A declaration whose
+   translated normal form is exponentially large (e.g. structure-eta-recursor terms over
+   brecOn) blows up here; with a budget set, the check aborts fast (bounded memory) and
+   names the offending declaration so it can be force-stubbed, instead of OOMing. [<0]
+   disables it. [tos_count] is reset per declaration by [prog_reset]. *)
+exception Materialization_budget of int
+
+let tos_budget = ref (-1)
+let tos_count = ref 0
+
+(* Heap-size guard (DK_MEM_BUDGET, in bytes; <0 disables). A robust catch-all for the
+   exponential-normal-form constants (structure-eta-recursor over brecOn): regardless of
+   *where* the blowup allocates (materialization, conversion obligation lists, caches),
+   we periodically check the major-heap size and abort fast — bounded memory — naming the
+   offending declaration so it can be force-stubbed, instead of OOMing the machine. *)
+let mem_budget = ref (-1)
+
+exception Mem_budget of int
+
+let check_mem () =
+  if !mem_budget >= 0 then begin
+    let bytes = (Gc.quick_stat ()).Gc.heap_words * (Sys.word_size / 8) in
+    if bytes > !mem_budget then begin
+      Printf.eprintf
+        "\n[DK_MEM_BUDGET] declaration %S exceeded heap budget (%d MB): its check is \
+         infeasible (force-stub it).\n%!"
+        !prog_decl (bytes / 1048576);
+      raise (Mem_budget bytes)
+    end
+  end
+
 (* count of rewrite-rule firings per head symbol — symbols whose count grows without
    bound are the ones being rewritten infinitely (the loop). *)
 let prog_rule_fires : (string, int) Hashtbl.t = Hashtbl.create 64
@@ -101,6 +143,69 @@ let pair_is_level (t1 : term) (t2 : term) : bool =
   in
   let is_lvl = function Some m -> List.mem m level_modules | None -> false in
   is_lvl (mod_of t1) || is_lvl (mod_of t2)
+
+(* ---------------------------------------------------------------------------
+   Convertibility memoization (DK_MEMO; disable with DK_NO_MEMO=1).
+
+   The Prod/PProd projection/eta rules are non-linear in their universe-level
+   arguments (required for the rules to be subject-reduction-correct), so every
+   match fires a level convertibility check via [constraint_convertibility]
+   (= [are_convertible]). On brecOn/Nat_rec-built structures these identical
+   level checks are run millions of times, which is what makes e.g.
+   `Nat.Linear.ExprCnstr.denote_toNormPoly` fail to terminate in practice.
+
+   We cache only *positive* (convertible) results, and only for level-typed
+   pairs while the full rule set is active (`selection = None`):
+   - positive-only + full-ruleset means the cache needs no invalidation:
+     convertibility is monotonic under signature extension (adding rules only
+     adds reducts, so `t1 == t2` stays true), and we never reuse a result under
+     a restricted rule selection.
+   - the level-pair restriction bounds key size (we never hash whole types) and
+     targets exactly the repeated checks.
+   The key uses [term_eq] (loc/binder-insensitive) with a matching bounded-depth
+   hash. --------------------------------------------------------------------- *)
+let dk_memo = (try Sys.getenv "DK_NO_MEMO" with Not_found -> "") = ""
+
+let rec term_hash (d : int) (t : term) : int =
+  if d <= 0 then 0
+  else
+    match t with
+    | Kind -> 1
+    | Type _ -> 2
+    | DB (_, _, n) -> Hashtbl.hash (3, n)
+    | Const (_, c) -> Hashtbl.hash (4, Hashtbl.hash c)
+    | App (f, a, l) ->
+        Hashtbl.hash
+          ( 5, term_hash (d - 1) f, term_hash (d - 1) a, List.length l,
+            match l with x :: _ -> term_hash (d - 1) x | [] -> 0 )
+    | Lam (_, _, _, b) -> Hashtbl.hash (6, term_hash (d - 1) b)
+    | Pi (_, _, a, b) -> Hashtbl.hash (7, term_hash (d - 1) a, term_hash (d - 1) b)
+
+module ConvKey = struct
+  type t = term * term
+
+  let equal (a, b) (c, d) = term_eq a c && term_eq b d
+  let hash (a, b) = Hashtbl.hash (term_hash 6 a, term_hash 6 b)
+end
+
+module ConvCache = Hashtbl.Make (ConvKey)
+
+(* presence of a key means "known convertible" (we only ever store `true`) *)
+let conv_cache : unit ConvCache.t = ConvCache.create 4096
+let conv_hits = ref 0
+
+(* Single-term-keyed cache module for reduction sharing (whnf memoization).
+   The value type ([state]) is filled in once [state] is in scope (see
+   [whnf_cache] below). See [whnf_cache] for the soundness discussion. *)
+module TermKey = struct
+  type t = term
+
+  let equal = term_eq
+  let hash t = term_hash 8 t
+end
+
+module WhnfCache = Hashtbl.Make (TermKey)
+let whnf_hits = ref 0
 
 (* depth-bounded term printer so we can dump giant/looping subterms cheaply *)
 let rec pp_trunc (d : int) (fmt : Format.formatter) (t : term) : unit =
@@ -138,6 +243,10 @@ let prog_reset (name : string) (total : int) : unit =
     prog_sw_steps := 0;
     prog_sw_last_t := (try Unix.gettimeofday () with _ -> 0.0);
     prog_sw_dumped := false;
+    prog_whnf_entry := None;
+    prog_whnf_entry_steps := 0;
+    prog_typing_ctx := [];
+    tos_count := 0;
     Hashtbl.clear prog_rule_fires;
     prog_last_t := (try Unix.gettimeofday () with _ -> 0.0);
     Printf.eprintf "[DK_PROGRESS] >>> checking %s (%d nodes)\n%!" name total)
@@ -154,9 +263,10 @@ let prog_beat () =
         "[DK_PROGRESS] %s: descent %d/%d (%.1f%%)  conv=%d (+%d/2s)  whnf=%d\n%!"
         !prog_decl !prog_nodes !prog_total pct !prog_conv
         (!prog_conv - !prog_last_conv) !prog_whnf;
-      Printf.eprintf "    conv composition: level=%d (+%d/2s)  other=%d (+%d/2s)\n%!"
+      Printf.eprintf
+        "    conv composition: level=%d (+%d/2s)  other=%d (+%d/2s)  conv_hits=%d  whnf_hits=%d\n%!"
         !prog_conv_lvl (!prog_conv_lvl - !prog_last_lvl)
-        !prog_conv_oth (!prog_conv_oth - !prog_last_oth);
+        !prog_conv_oth (!prog_conv_oth - !prog_last_oth) !conv_hits !whnf_hits;
       (match !prog_seed with
       | Some (l, r) ->
           Format.eprintf "    seed L: %a@.    seed R: %a@." (pp_trunc 10) l (pp_trunc 10) r
@@ -251,14 +361,54 @@ and stack = state ref list
 (* TODO: implement  constant time random access / in place mutable value.  *)
 
 let rec term_of_state {ctx; term; stack} : term =
+  (if !tos_budget >= 0 || !mem_budget >= 0 then begin
+     incr tos_count;
+     if !tos_budget >= 0 && !tos_count > !tos_budget then begin
+       Printf.eprintf
+         "\n[DK_TOS_BUDGET] declaration %S exceeded materialization budget (%d term nodes): \
+          its translated normal form is too large to check (force-stub it).\n%!"
+         !prog_decl !tos_count;
+       raise (Materialization_budget !tos_count)
+     end;
+     (* materializing a huge term keeps [state_whnf]/conv counters idle, so also poll the
+        heap guard here (every ~256k nodes) to catch term_of_state-driven blowups. *)
+     if !mem_budget >= 0 && !tos_count land 0x3FFFF = 0 then check_mem ()
+   end);
   let t = if LList.is_empty ctx then term else Subst.psubst_l ctx term in
   mk_App2 t (List.map term_of_state_ref stack)
 
 and term_of_state_ref r = term_of_state !r
 
+let () = tos_budget := (try int_of_string (Sys.getenv "DK_TOS_BUDGET") with _ -> -1)
+let () = mem_budget := (try int_of_string (Sys.getenv "DK_MEM_BUDGET") with _ -> -1)
+
 let state_of_term t = {ctx = LList.nil; term = t; stack = []}
 
 let state_ref_of_term t = ref {ctx = LList.nil; term = t; stack = []}
+
+(* whnf memoization cache (reduction sharing). A rule RHS that duplicates a
+   pattern variable -- the structure-eta recursor
+   `Prod_rec C f x --> f (Prod_fst x) (Prod_snd x)` is the motivating case --
+   otherwise re-reduces the shared subterm once per occurrence; on nested
+   brecOn/PProd structures that is exponential. We memoize the whnf of closed,
+   unapplied, redex-headed states so the reduction is shared.
+
+   whnf is NOT monotone under signature extension, so this cache MUST be cleared
+   when the signature changes: the typing module calls [clear_conv_cache] per
+   declaration. It is only consulted while the full rule set is active
+   (`selection = None`). *)
+let whnf_cache : state WhnfCache.t = WhnfCache.create 4096
+
+let clear_conv_cache () =
+  ConvCache.clear conv_cache;
+  WhnfCache.clear whnf_cache;
+  conv_hits := 0;
+  whnf_hits := 0
+
+(* Invalidate the memoization caches whenever the signature changes (see the
+   cache headers: convertibility is monotone so [conv_cache] could persist, but
+   whnf is not, so we clear both for safety). *)
+let () = Signature.on_signature_change := clear_conv_cache
 
 (**************** Pretty Printing ****************)
 
@@ -584,37 +734,38 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
   *)
     if dk_progress then begin
       incr prog_sw_steps;
-      (* One-shot: dump the first `maxhelper`-headed redex once we're clearly in the
-         loop. Checked frequently (every 0x3F steps) so we don't miss it. This is the
-         self-contained level-normalization redex `maxhelper (cons …) v`. *)
-      if (not !prog_sw_dumped) && !prog_sw_steps > 100_000 && !prog_sw_steps land 0x3F = 0
+      (* One-shot: a *single* whnf call has run >400k state_whnf steps without
+         returning (measured per-call via [prog_whnf_entry_steps], not the cumulative
+         counter): [prog_whnf_entry] is then the self-contained term whose reduction
+         does not terminate. Dump it closed over the current typing context (set by
+         typing.ml) as a ready-to-run `#EVAL`, plus the current redex for reference. *)
+      if (not !prog_sw_dumped)
+         && !prog_sw_steps - !prog_whnf_entry_steps > 400_000
+         && !prog_sw_steps land 0x3F = 0
       then begin
-        let is_mh =
-          match prog_head st.term with
-          | Const (_, n) -> string_of_ident (id n) = "maxhelper"
-          | _ -> false
-        in
-        if is_mh then begin
-          prog_sw_dumped := true;
-          let cur = try term_of_state st with _ -> st.term in
-          (try
-             let oc = open_out "/tmp/dk_whnf_loop.txt" in
-             let fmt = Format.formatter_of_out_channel oc in
-             Format.fprintf fmt
-               "looping maxhelper redex (state_whnf step %d):@.%a@.@."
-               !prog_sw_steps pp_term cur;
-             (match !prog_seed with
-              | Some (l, r) ->
-                  Format.fprintf fmt "OUTERMOST are_convertible seed (the looping check):@.SEED L:@.%a@.@.SEED R:@.%a@."
-                    pp_term l pp_term r
-              | None -> Format.fprintf fmt "(no seed captured)@.");
-             Format.pp_print_flush fmt ();
-             close_out oc;
-             Printf.eprintf "    [dumped looping maxhelper redex + seed to /tmp/dk_whnf_loop.txt]\n%!"
-           with _ -> ())
-        end
+        prog_sw_dumped := true;
+        let cur = try term_of_state st with _ -> st.term in
+        let closed t = List.fold_left
+            (fun body (l, x, a) -> mk_Lam l x (Some a) body) t !prog_typing_ctx in
+        (try
+           let oc = open_out "/tmp/dk_whnf_entry.txt" in
+           let fmt = Format.formatter_of_out_channel oc in
+           (match !prog_whnf_entry with
+            | Some e ->
+                Format.fprintf fmt "WHNF_ENTRY (raw, may have free DB vars):@.%a@.@." pp_term e;
+                Format.fprintf fmt
+                  "WHNF_ENTRY_CLOSED (lambda-closed over typing ctx, %d binders):@.%a@.@."
+                  (List.length !prog_typing_ctx) pp_term (closed e)
+            | None -> Format.fprintf fmt "(no whnf entry captured)@.@.");
+           Format.fprintf fmt "CURRENT_REDEX (state_whnf step %d):@.%a@."
+             !prog_sw_steps pp_term cur;
+           Format.pp_print_flush fmt ();
+           close_out oc;
+           Printf.eprintf "    [dumped looping whnf entry to /tmp/dk_whnf_entry.txt]\n%!"
+         with _ -> ())
       end;
       if !prog_sw_steps land 0x3FFF = 0 then begin
+        check_mem ();
         let now = try Unix.gettimeofday () with _ -> 0.0 in
         if now -. !prog_sw_last_t >= 2.0 then begin
           prog_sw_last_t := now;
@@ -626,6 +777,7 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
       end
     end;
     let rec_call ctx term stack = state_whnf sg {ctx; term; stack} in
+    let compute () =
     match st with
     (* Weak head beta normal terms *)
     | {term = Type _; _}
@@ -672,6 +824,25 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
             | Some (_, ctx, term) ->
                 if dk_progress then prog_rule_bump n;
                 rec_call ctx term s2))
+    in
+    (* Reduction sharing (DK_MEMO): memoize the whnf of closed, unapplied states
+       whose head is a (potential) redex, so a duplicated subterm is reduced once.
+       Sound within a fixed signature + full rule selection; the cache is cleared
+       per declaration by the typing module (whnf is not monotone in the signature). *)
+    match st with
+    | {ctx; term; stack = []}
+      when dk_memo && LList.is_empty ctx
+           && (match !selection with None -> true | _ -> false)
+           && (match term with Const _ | App (Const _, _, _) -> true | _ -> false) -> (
+        match WhnfCache.find_opt whnf_cache term with
+        | Some s ->
+            if dk_progress then incr whnf_hits;
+            s
+        | None ->
+            let s = compute () in
+            WhnfCache.replace whnf_cache term s;
+            s)
+    | _ -> compute ()
 
   (* ************************************************************** *)
 
@@ -680,6 +851,7 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
     if dk_progress then (
       incr prog_whnf;
       prog_whnf_entry := Some term;
+      prog_whnf_entry_steps := !prog_sw_steps;
       if !prog_whnf land 0x3FFF = 0 then prog_beat ());
     term_of_state (state_whnf sg (state_of_term term))
 
@@ -737,7 +909,7 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
           incr prog_conv;
           if pair_is_level t1 t2 then incr prog_conv_lvl else incr prog_conv_oth;
           prog_cur := Some (t1, t2);
-          if !prog_conv land 0x3FFF = 0 then prog_beat ());
+          if !prog_conv land 0x3FFF = 0 then (check_mem (); prog_beat ()));
         (* Check physical equality first for optimisation. *)
         if t1 == t2 then are_convertible_lst sg lst
           (* This test can be less expensive than computing the `whnf` if the
@@ -765,9 +937,25 @@ module Make (C : ConvChecker) (M : Matching.Matcher) : S = struct
     if dk_progress then (
       if !prog_depth = 0 then prog_seed := Some (t1, t2);
       incr prog_depth);
+    (* Memoize positive level-convertibility under the full rule set (see header).
+       Restricted to level pairs: caching all pairs was tried and only bloated memory
+       on `denote_toNormPoly` (its comparison pairs are largely distinct, so nothing is
+       reused) without collapsing the work. *)
+    let memoable =
+      dk_memo && (match !selection with None -> true | _ -> false)
+      && pair_is_level t1 t2
+    in
     let r =
-      try are_convertible_lst sg [(t1, t2)]
-      with Not_convertible | Invalid_argument _ -> false
+      if memoable && ConvCache.mem conv_cache (t1, t2) then (
+        incr conv_hits;
+        true)
+      else
+        let b =
+          try are_convertible_lst sg [(t1, t2)]
+          with Not_convertible | Invalid_argument _ -> false
+        in
+        if memoable && b then ConvCache.replace conv_cache (t1, t2) ();
+        b
     in
     if dk_progress then decr prog_depth;
     r

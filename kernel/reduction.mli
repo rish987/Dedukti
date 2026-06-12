@@ -11,6 +11,18 @@ val dk_progress : bool
 (** Type-checker descent-node counter, driven by the typing module. *)
 val prog_nodes : int ref
 
+(** Convertibility memoization (see reduction.ml). Enabled unless DK_NO_MEMO is set.
+    Caches only positive level-convertibility results, which are monotone under
+    signature extension, so [clear_conv_cache] is optional (exposed for safety). *)
+val dk_memo : bool
+
+val clear_conv_cache : unit -> unit
+
+(** Typing context (Gamma) of the in-progress convertibility check, stashed by the
+    typing module so a looping subterm can be lambda-closed into a standalone term.
+    Innermost binder (DB 0) is the list head. *)
+val prog_typing_ctx : (Basic.loc * Basic.ident * Term.term) list ref
+
 (** [prog_reset name total] starts progress tracking for declaration [name]
     whose term has [total] nodes. *)
 val prog_reset : string -> int -> unit

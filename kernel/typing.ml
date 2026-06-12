@@ -138,6 +138,7 @@ module Make (R : Reduction.S) : S = struct
         Debug.(
           debug d_typeChecking "Checking convertibility: %a ~ %a" pp_term ty_inf
             pp_term ty_exp);
+        if Reduction.dk_progress then Reduction.prog_typing_ctx := ctx;
         if not (SR.convertible sg c d ty_inf ty_exp) then
           let ty_exp' = rename_vars_with_typed_context ctx ty_exp in
           raise (Typing_error (ConvertibilityError (te, ctx, ty_exp', ty_inf)))
